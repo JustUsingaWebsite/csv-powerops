@@ -10,68 +10,69 @@ import (
 )
 
 func main() {
-	// Master table (Manager dataset)
+	// Master dataset
 	master := types.TableData{
 		HasHeader: true,
-		Header:    []string{"Manager Name", "Age", "Years Spent", "Gender"},
+		Header:    []string{"DeviceName", "LoggedOnUsers", "LastLoggedOn"},
 		Rows: [][]string{
-			{"Alice Smith", "34", "5", "F"},
-			{"Bob Jones", "45", "10", "M"},
-			{"Carol White", "29", "2", "F"},
+			{"device1", "jake,paul", "2024-11-11"},
+			{"device2", "alice", "2024-10-10"},
 		},
 	}
 
-	// One or more list tables to compare against master
-	list1 := types.NamedTable{
-		Name:    "list1",
-		ListKey: "Name", // header name in this list to match master key
+	// List A
+	listA := types.NamedTable{
+		Name:    "listA",
+		ListKey: "DeviceName",
 		Table: types.TableData{
 			HasHeader: true,
-			Header:    []string{"Name", "Age", "years did", "gender"},
+			Header:    []string{"Device", "User", "Note"},
 			Rows: [][]string{
-				{"Alice Smith", "33", "53", "M"},
-				{"David Green", "403", "70", "F"},
-				{"bob jones", "455", "100", "F"},
+				{"device1", "sue", "hr"},
+				{"device1", "paul", "dup-case"},
+				{"device3", "tom", "other"},
 			},
 		},
 	}
 
-	list2 := types.NamedTable{
-		Name:    "list2",
-		ListKey: "Name",
+	// List B
+	listB := types.NamedTable{
+		Name:    "listB",
+		ListKey: "DeviceName",
 		Table: types.TableData{
 			HasHeader: true,
-			Header:    []string{"Name", "Age", "years did", "gender"},
+			Header:    []string{"DeviceName", "User"},
 			Rows: [][]string{
-				{"Alice Smith", "34", "5", "F"},
-				{"David Green", "40", "7", "M"},
-				{"bob jones", "45", "10", "M"},
+				{"device1", "dave"},
+				{"device2", "bob"},
 			},
 		},
 	}
 
-	// Build the CrossRefMulti request (master + N lists)
-	req := csvops.CrossRefMultiRequest{
-		Operation: "crossref",
-		Options: csvops.CrossRefMultiOptions{
-			MatchMethod:    csvops.MatchCaseInsensitive, // case-insensitive match
-			MasterKey:      "Manager Name",              // header in master to match on
-			DefaultListKey: "",                          // not needed because lists provide ListKey
-			TrimSpaces:     true,
+	// Build request for OneToMany (search for device1)
+	req := csvops.OneToManyRequest{
+		Operation: "one_to_many",
+		Options: csvops.OneToManyOptions{
+			MatchMethod: csvops.MatchCaseInsensitive,
+			TrimSpaces:  true,
+		},
+		Target: csvops.OneToManyTarget{
+			Key:   "DeviceName",
+			Value: "device1",
 		},
 		Datasets: types.MultiDatasets{
 			Master: master,
-			Lists:  []types.NamedTable{list1, list2},
+			Lists:  []types.NamedTable{listA, listB},
 		},
 	}
 
-	// Call the function
-	resp, err := csvops.CrossRefMulti(req)
+	// Call OneToMany
+	resp, err := csvops.OneToMany(req)
 	if err != nil {
-		log.Fatalf("CrossRefMulti failed: %v", err)
+		log.Fatalf("OneToMany failed: %v", err)
 	}
 
-	// Pretty-print JSON response
+	// Pretty-print the JSON response
 	out, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
 		log.Fatalf("json marshal failed: %v", err)
