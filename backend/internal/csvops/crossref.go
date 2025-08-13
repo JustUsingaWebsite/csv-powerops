@@ -1,7 +1,6 @@
 package csvops
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -10,169 +9,149 @@ import (
 	"github.com/JustUsingaWebsite/csv-powerops/backend/internal/utils"
 )
 
-// --- match/action types ---
+// Only the minimal types needed for multi-list crossref
+
 type MatchMethod string
-type ActionType string
 
 const (
 	MatchExact           MatchMethod = "exact"
 	MatchCaseInsensitive MatchMethod = "case_insensitive"
-
-	ActionTagged      ActionType = "tagged"
-	ActionMatchesOnly ActionType = "matches_only"
-	ActionMissingOnly ActionType = "missing_only"
 )
 
-// --- request/response types for crossref ---
-
-type CrossRefRequest struct {
-	Operation string           `json:"operation"`
-	Options   CrossRefOptions  `json:"options"`
-	Datasets  CrossRefDatasets `json:"datasets"`
+// CrossRefMultiRequest carries a master table and an array of named lists to compare.
+type CrossRefMultiRequest struct {
+	Operation string               `json:"operation"`
+	Options   CrossRefMultiOptions `json:"options"`
+	Datasets  types.MultiDatasets  `json:"datasets"`
 }
 
-type CrossRefOptions struct {
-	MatchMethod     MatchMethod `json:"match_method"`
-	Action          ActionType  `json:"action"`
-	MasterKey       string      `json:"master_key"`
-	ListKey         string      `json:"list_key"`
-	TrimSpaces      bool        `json:"trim_spaces"`
-	FoundColumnName string      `json:"found_column_name"`
+type CrossRefMultiOptions struct {
+	MatchMethod    MatchMethod `json:"match_method"` // exact | case_insensitive
+	MasterKey      string      `json:"master_key"`   // header name or numeric index string
+	DefaultListKey string      `json:"list_key"`     // fallback list key if per-list not provided
+	TrimSpaces     bool        `json:"trim_spaces"`
 }
 
-type CrossRefDatasets struct {
-	Master types.TableData `json:"master"`
-	List   types.TableData `json:"list"`
+// PerListResult returns stats and the matched rows for a single list.
+type PerListResult struct {
+	Name      string          `json:"name"`
+	Processed int             `json:"processed"`
+	Matched   int             `json:"matched"`
+	Missing   int             `json:"missing"`
+	Result    types.TableData `json:"result"`
+	Error     *string         `json:"error"`
 }
 
-type CrossRefResponse struct {
-	Operation string              `json:"operation"`
-	Summary   types.ResultSummary `json:"summary"`
-	Result    types.TableData     `json:"result"`
-	Error     *string             `json:"error"`
+// CrossRefMultiResponse contains per-list results and a small summary.
+type CrossRefMultiResponse struct {
+	Operation string          `json:"operation"`
+	Summary   map[string]int  `json:"summary"`
+	PerList   []PerListResult `json:"per_list"`
+	Error     *string         `json:"error"`
 }
 
-// --- Core function ---
-
-// CrossRefJSON performs cross-referencing using shared types/utils.
-func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
-	var res CrossRefResponse
+// CrossRefMulti compares the master key against each list and returns matched rows per list.
+// It does not merge results. Non-fatal list-level errors are reported in per_list[].error.
+func CrossRefMulti(req CrossRefMultiRequest) (CrossRefMultiResponse, error) {
+	var res CrossRefMultiResponse
 	res.Operation = req.Operation
 	start := time.Now()
 
-	// Validate
+	// validate master key presence
 	if strings.TrimSpace(req.Options.MasterKey) == "" {
-		return resWithErr(res, "master_key is required"), errors.New("master_key required")
-	}
-	if req.Options.Action == "" {
-		return resWithErr(res, "action is required"), errors.New("action required")
-	}
-	// If action==tagged enforce match method
-	if req.Options.Action == ActionTagged && req.Options.MatchMethod == "" {
-		return resWithErr(res, "match_method is required when action=tagged"), errors.New("match_method required for tagging")
+		msg := "master_key required"
+		res.Error = &msg
+		return res, errors.New(msg)
 	}
 
-	// keys
-	mKey := req.Options.MasterKey
-	lKey := req.Options.ListKey
-	if strings.TrimSpace(lKey) == "" {
-		lKey = mKey
-	}
-
-	// resolve indices using utils.ResolveKeyIndex
-	mKeyIdx, err := utils.ResolveKeyIndex(req.Datasets.Master, mKey)
+	// resolve master key index
+	mKeyIdx, err := utils.ResolveKeyIndex(req.Datasets.Master, req.Options.MasterKey)
 	if err != nil {
-		return resWithErr(res, "master key resolution: "+err.Error()), err
-	}
-	lKeyIdx, err := utils.ResolveKeyIndex(req.Datasets.List, lKey)
-	if err != nil {
-		return resWithErr(res, "list key resolution: "+err.Error()), err
+		msg := "master key resolution: " + err.Error()
+		res.Error = &msg
+		return res, err
 	}
 
-	// Build master lookup set
+	// build normalized master set
 	masterSet := make(map[string]struct{}, len(req.Datasets.Master.Rows))
 	for _, row := range req.Datasets.Master.Rows {
 		if mKeyIdx < 0 || mKeyIdx >= len(row) {
 			continue
 		}
-		val := row[mKeyIdx]
-		norm := utils.Normalize(val, req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
-		masterSet[norm] = struct{}{}
+		n := utils.Normalize(row[mKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
+		masterSet[n] = struct{}{}
 	}
 
-	// iterate list rows and build result according to action
-	var processed, matched, missing int
-	resultRows := make([][]string, 0, len(req.Datasets.List.Rows))
-	resultHeader := append([]string(nil), req.Datasets.List.Header...)
+	totalProcessed := 0
+	totalMatched := 0
+	perList := make([]PerListResult, 0, len(req.Datasets.Lists))
 
-	if req.Options.Action == ActionTagged {
-		foundName := req.Options.FoundColumnName
-		if strings.TrimSpace(foundName) == "" {
-			foundName = "tagged"
-		}
-		resultHeader = append(resultHeader, foundName)
-	}
+	// iterate each provided list
+	for _, named := range req.Datasets.Lists {
+		pl := PerListResult{Name: named.Name}
 
-	for _, row := range req.Datasets.List.Rows {
-		processed++
-		var present bool
-		if lKeyIdx >= 0 && lKeyIdx < len(row) {
-			k := row[lKeyIdx]
-			n := utils.Normalize(k, req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
-			_, present = masterSet[n]
-		} else {
-			present = false
+		// determine list key (per-list override -> default -> master key)
+		listKey := strings.TrimSpace(named.ListKey)
+		if listKey == "" {
+			listKey = req.Options.DefaultListKey
 		}
-		if present {
-			matched++
-		} else {
-			missing++
+		if listKey == "" {
+			listKey = req.Options.MasterKey
 		}
 
-		switch req.Options.Action {
-		case ActionTagged:
-			if present { // NEW behavior: tagged returns only matched rows with tag=true
-				newRow := append([]string(nil), row...)
-				newRow = append(newRow, "true")
-				resultRows = append(resultRows, newRow)
+		// resolve index for list
+		lKeyIdx, err := utils.ResolveKeyIndex(named.Table, listKey)
+		if err != nil {
+			msg := "list key resolution: " + err.Error()
+			pl.Error = &msg
+			perList = append(perList, pl)
+			continue // skip this list but continue others
+		}
+
+		matches := [][]string{}
+		processed := 0
+		matched := 0
+		missing := 0
+
+		for _, row := range named.Table.Rows {
+			processed++
+			totalProcessed++
+			keyVal := ""
+			if lKeyIdx < len(row) {
+				keyVal = utils.Normalize(row[lKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
 			}
-		case ActionMatchesOnly:
-			if present {
-				resultRows = append(resultRows, append([]string(nil), row...))
+			if _, ok := masterSet[keyVal]; ok {
+				matched++
+				totalMatched++
+				// copy row to avoid aliasing
+				matches = append(matches, append([]string(nil), row...))
+			} else {
+				missing++
 			}
-		case ActionMissingOnly:
-			if !present {
-				resultRows = append(resultRows, append([]string(nil), row...))
-			}
-		default:
-			return resWithErr(res, "unsupported action"), errors.New("unsupported action")
 		}
+
+		pl.Processed = processed
+		pl.Matched = matched
+		pl.Missing = missing
+		pl.Result = types.TableData{
+			HasHeader: named.Table.HasHeader,
+			Header:    append([]string(nil), named.Table.Header...),
+			Rows:      matches,
+		}
+
+		perList = append(perList, pl)
 	}
 
-	res.Summary = types.ResultSummary{
-		Processed:  processed,
-		Matched:    matched,
-		Missing:    missing,
-		DurationMS: time.Since(start).Milliseconds(),
+	// summary
+	res.Summary = map[string]int{
+		"master_count":    len(req.Datasets.Master.Rows),
+		"lists_count":     len(req.Datasets.Lists),
+		"processed_total": totalProcessed,
+		"matched_total":   totalMatched,
 	}
-	res.Result = types.TableData{
-		HasHeader: req.Datasets.List.HasHeader,
-		Header:    resultHeader,
-		Rows:      resultRows,
-	}
+	res.PerList = perList
 	res.Error = nil
+	// add duration in ms
+	res.Summary["duration_ms"] = int(time.Since(start).Milliseconds())
 	return res, nil
-}
-
-// --- helpers ---
-func resWithErr(r CrossRefResponse, msg string) CrossRefResponse {
-	r.Error = &msg
-	return r
-}
-
-// Decode helper if you receive raw JSON bytes
-func DecodeCrossRefRequest(data []byte) (CrossRefRequest, error) {
-	var req CrossRefRequest
-	err := json.Unmarshal(data, &req)
-	return req, err
 }

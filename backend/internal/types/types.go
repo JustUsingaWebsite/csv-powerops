@@ -21,3 +21,15 @@ type OpOptions struct {
 	TrimSpaces         bool `json:"trim_spaces"`
 	KeyCaseInsensitive bool `json:"key_case_insensitive"`
 }
+
+type NamedTable struct {
+	Name    string    `json:"name"`
+	Table   TableData `json:"table"`
+	ListKey string    `json:"list_key,omitempty"`
+}
+
+// MultiDatasets groups master + many lists.
+type MultiDatasets struct {
+	Master TableData    `json:"master"`
+	Lists  []NamedTable `json:"lists"`
+}
