@@ -1,292 +1,213 @@
 package csvops
 
 import (
-	"bufio"
-	"encoding/csv"
+	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// CrossRefMode controls the output behaviour.
-type CrossRefMode string
+// --- Types for request/response ---
+
+type MatchMethod string
+type ActionType string
 
 const (
-	ModeMark    CrossRefMode = "mark"    // append a found column
-	ModeExtract CrossRefMode = "extract" // output only matching rows
-	ModeMissing CrossRefMode = "missing" // output only non-matching rows
+	MatchExact           MatchMethod = "exact"
+	MatchCaseInsensitive MatchMethod = "case_insensitive"
+
+	ActionTagged      ActionType = "tagged"
+	ActionMatchesOnly ActionType = "matches_only"
+	ActionMissingOnly ActionType = "missing_only"
 )
 
-// CrossRefOptions contains configuration for a cross-reference run.
+// CrossRefRequest represents incoming JSON.
+type CrossRefRequest struct {
+	Operation string           `json:"operation"`
+	Options   CrossRefOptions  `json:"options"`
+	Datasets  CrossRefDatasets `json:"datasets"`
+}
+
 type CrossRefOptions struct {
-	MasterPath         string // path to master CSV
-	ListPath           string // path to list CSV to check against master
-	Key                string // column name (or numeric index as string) to use as key
-	OutPath            string // path to write resulting CSV (required)
-	MasterHasHeader    bool   // default true
-	ListHasHeader      bool   // default true
-	Delim              rune   // default ',' if 0
-	Mode               CrossRefMode
-	KeyCaseInsensitive bool   // if true, lowercase keys before comparing
-	TrimSpaces         bool   // if true, trim spaces on keys
-	SortOutput         bool   // if true, sort matches/missing before writing
-	FoundColumnName    string // name of appended column when ModeMark; default "found" if empty
+	MatchMethod     MatchMethod `json:"match_method"` // required for tagging per your rule
+	Action          ActionType  `json:"action"`       // tagged | matches_only | missing_only
+	MasterKey       string      `json:"master_key"`   // header name or numeric index string
+	ListKey         string      `json:"list_key"`     // optional; if empty, MasterKey will be used for list too
+	TrimSpaces      bool        `json:"trim_spaces"`
+	FoundColumnName string      `json:"found_column_name"` // only used for tagged
 }
 
-// ResultSummary is returned after a crossref operation.
+type CrossRefDatasets struct {
+	Master TableData `json:"master"`
+	List   TableData `json:"list"`
+}
+
+type TableData struct {
+	HasHeader bool       `json:"hasHeader"`
+	Header    []string   `json:"header"`
+	Rows      [][]string `json:"rows"`
+}
+
+type CrossRefResponse struct {
+	Operation string        `json:"operation"`
+	Summary   ResultSummary `json:"summary"`
+	Result    TableData     `json:"result"`
+	Error     *string       `json:"error"` // nil on success
+}
+
 type ResultSummary struct {
-	Processed  int    // number of rows processed from list file
-	Matched    int    // rows matching master
-	Missing    int    // rows not found in master
-	OutputPath string // path written
-	DurationMS int64  // milliseconds taken
+	Processed  int   `json:"processed"`
+	Matched    int   `json:"matched"`
+	Missing    int   `json:"missing"`
+	DurationMS int64 `json:"durationMs"`
 }
 
-// CrossRef performs the list cross-referencing operation.
-func CrossRef(opts CrossRefOptions) (ResultSummary, error) {
-	var res ResultSummary
+// --- Core function ---
+
+// CrossRefJSON performs cross-referencing using the agreed JSON contract.
+// It returns a CrossRefResponse (struct) and an error (non-nil for internal failure).
+func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
+	var res CrossRefResponse
+	res.Operation = req.Operation
 	start := time.Now()
 
-	// basic validation & defaults
-	if opts.MasterPath == "" || opts.ListPath == "" {
-		return res, errors.New("master and list paths are required")
+	// Validate options
+	if req.Options.MasterKey == "" {
+		return resWithErr(res, "master_key is required"), errors.New("master_key required")
 	}
-	if opts.Key == "" {
-		return res, errors.New("key is required (column name or numeric index as string)")
+	if req.Options.Action == "" {
+		return resWithErr(res, "action is required (tagged|matches_only|missing_only)"), errors.New("action required")
 	}
-	if opts.OutPath == "" {
-		return res, errors.New("outPath is required (where the output CSV will be written)")
-	}
-	if opts.Delim == 0 {
-		opts.Delim = ','
-	}
-	if opts.FoundColumnName == "" {
-		opts.FoundColumnName = "found"
-	}
-	if opts.Mode == "" {
-		opts.Mode = ModeMark
+	// Enforce your rule: if action == tagged, require a match method
+	if req.Options.Action == ActionTagged && req.Options.MatchMethod == "" {
+		return resWithErr(res, "match_method is required when action=tagged"), errors.New("match_method required for tagging")
 	}
 
-	// -- Build master key set --
-	masterSet, mKeyIdx, mHeader, err := buildKeySet(opts.MasterPath, opts.MasterHasHeader, opts.Key, opts.Delim, opts)
+	// Determine which key names/indices to use for master & list
+	mKey := req.Options.MasterKey
+	lKey := req.Options.ListKey
+	if lKey == "" {
+		lKey = mKey
+	}
+
+	// Resolve master key index
+	mKeyIdx, err := resolveKeyIndex(req.Datasets.Master, mKey)
 	if err != nil {
-		return res, err
+		return resWithErr(res, "master key resolution: "+err.Error()), err
 	}
-
-	// -- Read list --
-	lfile, err := os.Open(opts.ListPath)
+	// Resolve list key index
+	lKeyIdx, err := resolveKeyIndex(req.Datasets.List, lKey)
 	if err != nil {
-		return res, fmt.Errorf("open list file: %w", err)
-	}
-	defer lfile.Close()
-
-	lreader := csv.NewReader(bufio.NewReader(lfile))
-	lreader.Comma = opts.Delim
-	lreader.LazyQuotes = true
-	lreader.FieldsPerRecord = -1
-
-	var lHeader []string
-	lKeyIdx := -1
-	if opts.ListHasHeader {
-		lHeader, err = lreader.Read()
-		if err != nil {
-			return res, fmt.Errorf("read list header: %w", err)
-		}
-		lKeyIdx = findColIndex(lHeader, opts.Key)
-		if lKeyIdx == -1 {
-			if idx, perr := strconv.Atoi(opts.Key); perr == nil {
-				if idx < 0 || idx >= len(lHeader) {
-					return res, fmt.Errorf("list key index %d out of range", idx)
-				}
-				lKeyIdx = idx
-			} else {
-				return res, fmt.Errorf("list key column '%s' not found in header", opts.Key)
-			}
-		}
-	} else {
-		idx, perr := strconv.Atoi(opts.Key)
-		if perr != nil {
-			return res, errors.New("list has no header; key must be numeric index like '0'")
-		}
-		lKeyIdx = idx
+		return resWithErr(res, "list key resolution: "+err.Error()), err
 	}
 
-	// -- Prepare output writer --
-	outf, err := os.Create(opts.OutPath)
-	if err != nil {
-		return res, fmt.Errorf("create out file: %w", err)
-	}
-	defer outf.Close()
-	writer := csv.NewWriter(outf)
-	writer.Comma = opts.Delim
-	defer writer.Flush()
-
-	// Optional buffering for sorting
-	var buffered [][]string
-
-	// write header
-	if opts.ListHasHeader {
-		switch opts.Mode {
-		case ModeMark:
-			hdr := append([]string(nil), lHeader...)
-			hdr = append(hdr, opts.FoundColumnName)
-			if err := writer.Write(hdr); err != nil {
-				return res, fmt.Errorf("write header: %w", err)
-			}
-		case ModeExtract, ModeMissing:
-			if err := writer.Write(lHeader); err != nil {
-				return res, fmt.Errorf("write header: %w", err)
-			}
-		}
-	}
-
-	// process list rows
-	for {
-		rec, err := lreader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return res, fmt.Errorf("reading list csv: %w", err)
-		}
-		res.Processed++
-
-		keyVal := ""
-		if lKeyIdx < len(rec) {
-			keyVal = normalize(rec[lKeyIdx], opts)
-		}
-		_, present := masterSet[keyVal]
-		if present {
-			res.Matched++
-		} else {
-			res.Missing++
-		}
-
-		switch opts.Mode {
-		case ModeMark:
-			outRec := append([]string(nil), rec...)
-			outRec = append(outRec, boolToStr(present))
-			if err := writer.Write(outRec); err != nil {
-				return res, fmt.Errorf("write record (mark): %w", err)
-			}
-		case ModeExtract:
-			if present {
-				if opts.SortOutput {
-					buffered = append(buffered, rec)
-				} else {
-					if err := writer.Write(rec); err != nil {
-						return res, fmt.Errorf("write record (extract): %w", err)
-					}
-				}
-			}
-		case ModeMissing:
-			if !present {
-				if opts.SortOutput {
-					buffered = append(buffered, rec)
-				} else {
-					if err := writer.Write(rec); err != nil {
-						return res, fmt.Errorf("write record (missing): %w", err)
-					}
-				}
-			}
-		}
-	}
-
-	// If sorting is enabled for extract/missing
-	if opts.SortOutput && len(buffered) > 0 {
-		sort.Slice(buffered, func(i, j int) bool {
-			return strings.Join(buffered[i], ",") < strings.Join(buffered[j], ",")
-		})
-		for _, rec := range buffered {
-			if err := writer.Write(rec); err != nil {
-				return res, fmt.Errorf("write sorted record: %w", err)
-			}
-		}
-	}
-
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		return res, fmt.Errorf("csv writer error: %w", err)
-	}
-
-	res.OutputPath = opts.OutPath
-	res.DurationMS = time.Since(start).Milliseconds()
-	return res, nil
-}
-
-// ---------- helper functions ----------
-
-// buildKeySet loads the master CSV and returns a lookup map.
-func buildKeySet(path string, hasHeader bool, key string, delim rune, opts CrossRefOptions) (map[string]struct{}, int, []string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, -1, nil, fmt.Errorf("open master file: %w", err)
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(bufio.NewReader(file))
-	reader.Comma = delim
-	reader.LazyQuotes = true
-	reader.FieldsPerRecord = -1
-
-	var header []string
-	keyIdx := -1
-	if hasHeader {
-		header, err = reader.Read()
-		if err != nil {
-			return nil, -1, nil, fmt.Errorf("read master header: %w", err)
-		}
-		keyIdx = findColIndex(header, key)
-		if keyIdx == -1 {
-			if idx, perr := strconv.Atoi(key); perr == nil {
-				if idx < 0 || idx >= len(header) {
-					return nil, -1, nil, fmt.Errorf("master key index %d out of range", idx)
-				}
-				keyIdx = idx
-			} else {
-				return nil, -1, nil, fmt.Errorf("master key column '%s' not found in header", key)
-			}
-		}
-	} else {
-		idx, perr := strconv.Atoi(key)
-		if perr != nil {
-			return nil, -1, nil, errors.New("master has no header; key must be numeric index like '0'")
-		}
-		keyIdx = idx
-	}
-
-	masterSet := make(map[string]struct{})
-	for {
-		rec, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, -1, nil, fmt.Errorf("reading master csv: %w", err)
-		}
-		if keyIdx >= len(rec) {
+	// Build master lookup set
+	masterSet := make(map[string]struct{}, len(req.Datasets.Master.Rows))
+	for _, row := range req.Datasets.Master.Rows {
+		if mKeyIdx < 0 || mKeyIdx >= len(row) {
 			continue
 		}
-		k := normalize(rec[keyIdx], opts)
+		k := normalize(row[mKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod)
 		masterSet[k] = struct{}{}
 	}
 
-	return masterSet, keyIdx, header, nil
-}
+	// Process list rows
+	var processed, matched, missing int
+	resultRows := make([][]string, 0, len(req.Datasets.List.Rows))
+	resultHeader := append([]string(nil), req.Datasets.List.Header...)
 
-func findColIndex(header []string, key string) int {
-	keyTrim := strings.TrimSpace(key)
-	for i, c := range header {
-		if strings.EqualFold(strings.TrimSpace(c), keyTrim) {
-			return i
+	// For tagged action, append found column to header
+	if req.Options.Action == ActionTagged {
+		foundName := req.Options.FoundColumnName
+		if strings.TrimSpace(foundName) == "" {
+			foundName = "tagged"
+		}
+		resultHeader = append(resultHeader, foundName)
+	}
+
+	for _, row := range req.Datasets.List.Rows {
+		processed++
+		var present bool
+		if lKeyIdx >= 0 && lKeyIdx < len(row) {
+			k := normalize(row[lKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod)
+			_, present = masterSet[k]
+		} else {
+			// missing key field in this row -> treat as not present
+			present = false
+		}
+		if present {
+			matched++
+		} else {
+			missing++
+		}
+
+		switch req.Options.Action {
+		case ActionTagged:
+			newRow := append([]string(nil), row...)
+			if present {
+				newRow = append(newRow, "true")
+			} else {
+				newRow = append(newRow, "false")
+			}
+			resultRows = append(resultRows, newRow)
+		case ActionMatchesOnly:
+			if present {
+				resultRows = append(resultRows, append([]string(nil), row...))
+			}
+		case ActionMissingOnly:
+			if !present {
+				resultRows = append(resultRows, append([]string(nil), row...))
+			}
+		default:
+			// unknown action (shouldn't happen because of earlier validation)
+			return resWithErr(res, "unsupported action"), errors.New("unsupported action")
 		}
 	}
-	return -1
+
+	// Fill response
+	res.Summary = ResultSummary{
+		Processed:  processed,
+		Matched:    matched,
+		Missing:    missing,
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	res.Result = TableData{
+		HasHeader: req.Datasets.List.HasHeader,
+		Header:    resultHeader,
+		Rows:      resultRows,
+	}
+	res.Error = nil
+	return res, nil
+}
+
+// --- Helpers ---
+
+// resolveKeyIndex returns the numeric index for a key that can be a header name or numeric index string.
+// If dataset.HasHeader == false, the key MUST be a numeric index string like "0".
+func resolveKeyIndex(tbl TableData, key string) (int, error) {
+	if tbl.HasHeader {
+		// try find by header name (case-insensitive, trimmed)
+		for i, h := range tbl.Header {
+			if strings.EqualFold(strings.TrimSpace(h), strings.TrimSpace(key)) {
+				return i, nil
+			}
+		}
+		// fallback: maybe key is numeric string pointing to index
+		if idx, err := strconv.Atoi(key); err == nil {
+			if idx < 0 || idx >= len(tbl.Header) {
+				return -1, errors.New("numeric key index out of range")
+			}
+			return idx, nil
+		}
+		return -1, errors.New("key not found in header")
+	}
+	// no header -> key must be numeric index
+	idx, err := strconv.Atoi(key)
+	if err != nil {
+		return -1, errors.New("no header: key must be numeric index string")
+	}
+	return idx, nil
 }
 
 // WhitespaceTrimmer removes leading/trailing/multiple spaces and normalizes whitespace.
@@ -296,19 +217,26 @@ func WhitespaceTrimmer(s string) string {
 	return s
 }
 
-func normalize(s string, opts CrossRefOptions) string {
-	if opts.TrimSpaces {
-		s = WhitespaceTrimmer(s)
+// normalize performs trimming and case normalization per options.
+// If matchMethod is empty, it behaves like exact match (no case-change).
+func normalize(val string, trim bool, matchMethod MatchMethod) string {
+	if trim {
+		val = WhitespaceTrimmer(val)
 	}
-	if opts.KeyCaseInsensitive {
-		s = strings.ToLower(s)
+	if matchMethod == MatchCaseInsensitive {
+		val = strings.ToLower(val)
 	}
-	return s
+	return val
 }
 
-func boolToStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
+func resWithErr(r CrossRefResponse, msg string) CrossRefResponse {
+	r.Error = &msg
+	return r
+}
+
+// Helper to decode raw JSON bytes into CrossRefRequest
+func DecodeCrossRefRequest(data []byte) (CrossRefRequest, error) {
+	var req CrossRefRequest
+	err := json.Unmarshal(data, &req)
+	return req, err
 }
