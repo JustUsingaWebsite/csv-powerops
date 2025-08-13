@@ -36,9 +36,9 @@ func main() {
 		Operation: "crossref",
 		Options: csvops.CrossRefOptions{
 			MatchMethod:     csvops.MatchCaseInsensitive,
-			Action:          csvops.ActionTagged,
-			MasterKey:       "Manager Name",
-			ListKey:         "Name",
+			Action:          csvops.ActionMissingOnly,
+			MasterKey:       master.Header[0],
+			ListKey:         list.Header[0],
 			TrimSpaces:      true,
 			FoundColumnName: "tagged",
 		},

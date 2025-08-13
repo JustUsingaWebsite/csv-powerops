@@ -66,7 +66,7 @@ type ResultSummary struct {
 // --- Core function ---
 
 // CrossRefJSON performs cross-referencing using the agreed JSON contract.
-// It returns a CrossRefResponse (struct) and an error (non-nil for internal failure).
+// Behavior change: ActionTagged now returns only matched rows (tagged=true).
 func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 	var res CrossRefResponse
 	res.Operation = req.Operation
@@ -79,7 +79,7 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 	if req.Options.Action == "" {
 		return resWithErr(res, "action is required (tagged|matches_only|missing_only)"), errors.New("action required")
 	}
-	// Enforce your rule: if action == tagged, require a match method
+	// Enforce: if action == tagged, require a match method
 	if req.Options.Action == ActionTagged && req.Options.MatchMethod == "" {
 		return resWithErr(res, "match_method is required when action=tagged"), errors.New("match_method required for tagging")
 	}
@@ -133,7 +133,6 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 			k := normalize(row[lKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod)
 			_, present = masterSet[k]
 		} else {
-			// missing key field in this row -> treat as not present
 			present = false
 		}
 		if present {
@@ -144,13 +143,12 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 
 		switch req.Options.Action {
 		case ActionTagged:
-			newRow := append([]string(nil), row...)
+			// NEW BEHAVIOR: append only MATCHED rows (tagged=true)
 			if present {
+				newRow := append([]string(nil), row...)
 				newRow = append(newRow, "true")
-			} else {
-				newRow = append(newRow, "false")
+				resultRows = append(resultRows, newRow)
 			}
-			resultRows = append(resultRows, newRow)
 		case ActionMatchesOnly:
 			if present {
 				resultRows = append(resultRows, append([]string(nil), row...))
@@ -160,7 +158,6 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 				resultRows = append(resultRows, append([]string(nil), row...))
 			}
 		default:
-			// unknown action (shouldn't happen because of earlier validation)
 			return resWithErr(res, "unsupported action"), errors.New("unsupported action")
 		}
 	}
