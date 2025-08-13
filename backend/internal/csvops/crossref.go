@@ -3,13 +3,14 @@ package csvops
 import (
 	"encoding/json"
 	"errors"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/JustUsingaWebsite/csv-powerops/backend/internal/types"
+	"github.com/JustUsingaWebsite/csv-powerops/backend/internal/utils"
 )
 
-// --- Types for request/response ---
-
+// --- match/action types ---
 type MatchMethod string
 type ActionType string
 
@@ -22,7 +23,8 @@ const (
 	ActionMissingOnly ActionType = "missing_only"
 )
 
-// CrossRefRequest represents incoming JSON.
+// --- request/response types for crossref ---
+
 type CrossRefRequest struct {
 	Operation string           `json:"operation"`
 	Options   CrossRefOptions  `json:"options"`
@@ -30,74 +32,59 @@ type CrossRefRequest struct {
 }
 
 type CrossRefOptions struct {
-	MatchMethod     MatchMethod `json:"match_method"` // required for tagging per your rule
-	Action          ActionType  `json:"action"`       // tagged | matches_only | missing_only
-	MasterKey       string      `json:"master_key"`   // header name or numeric index string
-	ListKey         string      `json:"list_key"`     // optional; if empty, MasterKey will be used for list too
+	MatchMethod     MatchMethod `json:"match_method"`
+	Action          ActionType  `json:"action"`
+	MasterKey       string      `json:"master_key"`
+	ListKey         string      `json:"list_key"`
 	TrimSpaces      bool        `json:"trim_spaces"`
-	FoundColumnName string      `json:"found_column_name"` // only used for tagged
+	FoundColumnName string      `json:"found_column_name"`
 }
 
 type CrossRefDatasets struct {
-	Master TableData `json:"master"`
-	List   TableData `json:"list"`
-}
-
-type TableData struct {
-	HasHeader bool       `json:"hasHeader"`
-	Header    []string   `json:"header"`
-	Rows      [][]string `json:"rows"`
+	Master types.TableData `json:"master"`
+	List   types.TableData `json:"list"`
 }
 
 type CrossRefResponse struct {
-	Operation string        `json:"operation"`
-	Summary   ResultSummary `json:"summary"`
-	Result    TableData     `json:"result"`
-	Error     *string       `json:"error"` // nil on success
-}
-
-type ResultSummary struct {
-	Processed  int   `json:"processed"`
-	Matched    int   `json:"matched"`
-	Missing    int   `json:"missing"`
-	DurationMS int64 `json:"durationMs"`
+	Operation string              `json:"operation"`
+	Summary   types.ResultSummary `json:"summary"`
+	Result    types.TableData     `json:"result"`
+	Error     *string             `json:"error"`
 }
 
 // --- Core function ---
 
-// CrossRefJSON performs cross-referencing using the agreed JSON contract.
-// Behavior change: ActionTagged now returns only matched rows (tagged=true).
+// CrossRefJSON performs cross-referencing using shared types/utils.
 func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 	var res CrossRefResponse
 	res.Operation = req.Operation
 	start := time.Now()
 
-	// Validate options
-	if req.Options.MasterKey == "" {
+	// Validate
+	if strings.TrimSpace(req.Options.MasterKey) == "" {
 		return resWithErr(res, "master_key is required"), errors.New("master_key required")
 	}
 	if req.Options.Action == "" {
-		return resWithErr(res, "action is required (tagged|matches_only|missing_only)"), errors.New("action required")
+		return resWithErr(res, "action is required"), errors.New("action required")
 	}
-	// Enforce: if action == tagged, require a match method
+	// If action==tagged enforce match method
 	if req.Options.Action == ActionTagged && req.Options.MatchMethod == "" {
 		return resWithErr(res, "match_method is required when action=tagged"), errors.New("match_method required for tagging")
 	}
 
-	// Determine which key names/indices to use for master & list
+	// keys
 	mKey := req.Options.MasterKey
 	lKey := req.Options.ListKey
-	if lKey == "" {
+	if strings.TrimSpace(lKey) == "" {
 		lKey = mKey
 	}
 
-	// Resolve master key index
-	mKeyIdx, err := resolveKeyIndex(req.Datasets.Master, mKey)
+	// resolve indices using utils.ResolveKeyIndex
+	mKeyIdx, err := utils.ResolveKeyIndex(req.Datasets.Master, mKey)
 	if err != nil {
 		return resWithErr(res, "master key resolution: "+err.Error()), err
 	}
-	// Resolve list key index
-	lKeyIdx, err := resolveKeyIndex(req.Datasets.List, lKey)
+	lKeyIdx, err := utils.ResolveKeyIndex(req.Datasets.List, lKey)
 	if err != nil {
 		return resWithErr(res, "list key resolution: "+err.Error()), err
 	}
@@ -108,16 +95,16 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 		if mKeyIdx < 0 || mKeyIdx >= len(row) {
 			continue
 		}
-		k := normalize(row[mKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod)
-		masterSet[k] = struct{}{}
+		val := row[mKeyIdx]
+		norm := utils.Normalize(val, req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
+		masterSet[norm] = struct{}{}
 	}
 
-	// Process list rows
+	// iterate list rows and build result according to action
 	var processed, matched, missing int
 	resultRows := make([][]string, 0, len(req.Datasets.List.Rows))
 	resultHeader := append([]string(nil), req.Datasets.List.Header...)
 
-	// For tagged action, append found column to header
 	if req.Options.Action == ActionTagged {
 		foundName := req.Options.FoundColumnName
 		if strings.TrimSpace(foundName) == "" {
@@ -130,8 +117,9 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 		processed++
 		var present bool
 		if lKeyIdx >= 0 && lKeyIdx < len(row) {
-			k := normalize(row[lKeyIdx], req.Options.TrimSpaces, req.Options.MatchMethod)
-			_, present = masterSet[k]
+			k := row[lKeyIdx]
+			n := utils.Normalize(k, req.Options.TrimSpaces, req.Options.MatchMethod == MatchCaseInsensitive)
+			_, present = masterSet[n]
 		} else {
 			present = false
 		}
@@ -143,8 +131,7 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 
 		switch req.Options.Action {
 		case ActionTagged:
-			// NEW BEHAVIOR: append only MATCHED rows (tagged=true)
-			if present {
+			if present { // NEW behavior: tagged returns only matched rows with tag=true
 				newRow := append([]string(nil), row...)
 				newRow = append(newRow, "true")
 				resultRows = append(resultRows, newRow)
@@ -162,14 +149,13 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 		}
 	}
 
-	// Fill response
-	res.Summary = ResultSummary{
+	res.Summary = types.ResultSummary{
 		Processed:  processed,
 		Matched:    matched,
 		Missing:    missing,
 		DurationMS: time.Since(start).Milliseconds(),
 	}
-	res.Result = TableData{
+	res.Result = types.TableData{
 		HasHeader: req.Datasets.List.HasHeader,
 		Header:    resultHeader,
 		Rows:      resultRows,
@@ -178,60 +164,13 @@ func CrossRefJSON(req CrossRefRequest) (CrossRefResponse, error) {
 	return res, nil
 }
 
-// --- Helpers ---
-
-// resolveKeyIndex returns the numeric index for a key that can be a header name or numeric index string.
-// If dataset.HasHeader == false, the key MUST be a numeric index string like "0".
-func resolveKeyIndex(tbl TableData, key string) (int, error) {
-	if tbl.HasHeader {
-		// try find by header name (case-insensitive, trimmed)
-		for i, h := range tbl.Header {
-			if strings.EqualFold(strings.TrimSpace(h), strings.TrimSpace(key)) {
-				return i, nil
-			}
-		}
-		// fallback: maybe key is numeric string pointing to index
-		if idx, err := strconv.Atoi(key); err == nil {
-			if idx < 0 || idx >= len(tbl.Header) {
-				return -1, errors.New("numeric key index out of range")
-			}
-			return idx, nil
-		}
-		return -1, errors.New("key not found in header")
-	}
-	// no header -> key must be numeric index
-	idx, err := strconv.Atoi(key)
-	if err != nil {
-		return -1, errors.New("no header: key must be numeric index string")
-	}
-	return idx, nil
-}
-
-// WhitespaceTrimmer removes leading/trailing/multiple spaces and normalizes whitespace.
-func WhitespaceTrimmer(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.Join(strings.Fields(s), " ") // collapse multiple spaces
-	return s
-}
-
-// normalize performs trimming and case normalization per options.
-// If matchMethod is empty, it behaves like exact match (no case-change).
-func normalize(val string, trim bool, matchMethod MatchMethod) string {
-	if trim {
-		val = WhitespaceTrimmer(val)
-	}
-	if matchMethod == MatchCaseInsensitive {
-		val = strings.ToLower(val)
-	}
-	return val
-}
-
+// --- helpers ---
 func resWithErr(r CrossRefResponse, msg string) CrossRefResponse {
 	r.Error = &msg
 	return r
 }
 
-// Helper to decode raw JSON bytes into CrossRefRequest
+// Decode helper if you receive raw JSON bytes
 func DecodeCrossRefRequest(data []byte) (CrossRefRequest, error) {
 	var req CrossRefRequest
 	err := json.Unmarshal(data, &req)
