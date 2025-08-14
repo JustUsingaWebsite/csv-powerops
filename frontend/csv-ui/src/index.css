@@ -1,0 +1,30 @@
+/* src/index.css */
+
+/* 1) Import Google Sans Code from Google Fonts (no local files required) */
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans+Code:wght@300;400;600;700;800&display=swap');
+
+/* Tailwind directives (keep if you use Tailwind) */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 2) Global UI usage (option A) — whole UI uses Google Sans Code
+   OR option B below to use it only for code elements. */
+
+/* --- OPTION A: Make Google Sans Code the UI font (universal) --- */
+body {
+  font-family: "Google Sans Code", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: #f8fafc;
+}
+
+/* --- OPTION B: (recommended) Keep UI proportional (Inter / system) and use Google Sans Code only for monospace/code elements ---
+body {
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: #f8fafc;
+}
+*/
+
+/* If you choose option B (code-only), uncomment below to target code blocks / JSON view: */
+code, pre, .mono, .json-viewer, .editor {
+  font-family: "Google Sans Code", ui-monospace, "SFMono-Regular", "Segoe UI Mono", "Consolas", "Roboto Mono", "Menlo", "Monaco", monospace;
+}
