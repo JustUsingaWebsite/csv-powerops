@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/JustUsingaWebsite/csv-powerops/backend/internal/types"
 )
@@ -53,4 +54,31 @@ func Normalize(val string, trim bool, caseInsensitive bool) string {
 		val = strings.ToLower(val)
 	}
 	return val
+}
+
+// ParseIndexString attempts to parse s as a non-negative integer index.
+// Returns (index, true) if s is a valid integer string like "0", "1", " 2 ".
+// Returns (0, false) otherwise (empty string, negative, contains non-digit chars).
+func ParseIndexString(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+
+	// Ensure every rune is a digit (reject signs, decimals, hex, etc.)
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return 0, false
+		}
+	}
+
+	// Parse integer (safe because we've checked digits only)
+	i, err := strconv.Atoi(s)
+	if err != nil || i < 0 {
+		return 0, false
+	}
+	return i, true
 }
