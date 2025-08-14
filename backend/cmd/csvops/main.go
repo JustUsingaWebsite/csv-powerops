@@ -10,69 +10,39 @@ import (
 )
 
 func main() {
-	// Master dataset
-	master := types.TableData{
+	// Sample dataset
+	data := types.TableData{
 		HasHeader: true,
-		Header:    []string{"DeviceName", "LoggedOnUsers", "LastLoggedOn"},
+		Header:    []string{"Device", "User", "Location"},
 		Rows: [][]string{
-			{"device1", "jake,paul", "2024-11-11"},
-			{"device2", "alice", "2024-10-10"},
+			{"DeviceA", "Alice", "HQ"},
+			{"DeviceB", "Bob", "Remote"},
+			{"DeviceC", "Alice", "Branch"},
+			{"DeviceD", "Charlie", "HQ"},
+			{"DeviceE", "Alice", "Remote"},
 		},
 	}
 
-	// List A
-	listA := types.NamedTable{
-		Name:    "listA",
-		ListKey: "DeviceName",
-		Table: types.TableData{
-			HasHeader: true,
-			Header:    []string{"Device", "User", "Note"},
-			Rows: [][]string{
-				{"device1", "sue", "hr"},
-				{"device1", "paul", "dup-case"},
-				{"device3", "tom", "other"},
-			},
-		},
-	}
-
-	// List B
-	listB := types.NamedTable{
-		Name:    "listB",
-		ListKey: "DeviceName",
-		Table: types.TableData{
-			HasHeader: true,
-			Header:    []string{"DeviceName", "User"},
-			Rows: [][]string{
-				{"device1", "dave"},
-				{"device2", "bob"},
-			},
-		},
-	}
-
-	// Build request for OneToMany (search for device1)
-	req := csvops.OneToManyRequest{
-		Operation: "one_to_many",
-		Options: csvops.OneToManyOptions{
+	// Request: Get all devices for Alice
+	req := csvops.ManyToOneRequest{
+		Operation: "many_to_one",
+		Options: csvops.ManyToOneOptions{
 			MatchMethod: csvops.MatchCaseInsensitive,
 			TrimSpaces:  true,
 		},
-		Target: csvops.OneToManyTarget{
-			Key:   "DeviceName",
-			Value: "device1",
+		Target: csvops.ManyToOneTarget{
+			OneKey:  "User",
+			ManyKey: "Device",
+			Value:   "Alice",
 		},
-		Datasets: types.MultiDatasets{
-			Master: master,
-			Lists:  []types.NamedTable{listA, listB},
-		},
+		Dataset: data,
 	}
 
-	// Call OneToMany
-	resp, err := csvops.OneToMany(req)
+	resp, err := csvops.ManyToOne(req)
 	if err != nil {
-		log.Fatalf("OneToMany failed: %v", err)
+		log.Fatalf("many_to_one failed: %v", err)
 	}
 
-	// Pretty-print the JSON response
 	out, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
 		log.Fatalf("json marshal failed: %v", err)
